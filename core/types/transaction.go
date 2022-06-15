@@ -52,6 +52,8 @@ const (
 	ArbitrumSubmitRetryableTxType = 105
 	ArbitrumInternalTxType        = 106
 	ArbitrumLegacyTxType          = 120
+	ShutterTxType                 = 0x50
+	BatchTxType                   = 0x5a
 )
 
 // Transaction is an Ethereum transaction.
@@ -98,6 +100,8 @@ type TxData interface {
 	setSignatureValues(chainID, v, r, s *big.Int)
 
 	isFake() bool
+
+	TxDataExtension
 }
 
 // EncodeRLP implements rlp.Encoder
@@ -229,6 +233,14 @@ func (tx *Transaction) decodeTyped(b []byte, arbParsing bool) (TxData, error) {
 		var inner ArbitrumLegacyTxData
 		err := rlp.DecodeBytes(b[1:], &inner)
 		return &inner, err
+	case ShutterTxType:
+		var inner ShutterTx
+		err := rlp.DecodeBytes(b[1:], &inner)
+		return &inner, err
+	case BatchTxType:
+		var inner BatchTx
+		err := rlp.DecodeBytes(b[1:], &inner)
+		return &inner, err
 	default:
 		return nil, ErrTxTypeNotSupported
 	}
@@ -333,6 +345,25 @@ func (tx *Transaction) Nonce() uint64 { return tx.inner.nonce() }
 func (tx *Transaction) To() *common.Address {
 	return copyAddressPtr(tx.inner.to())
 }
+
+// EncryptedPayload returns the encrypted payload of a Shutter transaction.
+func (tx *Transaction) EncryptedPayload() []byte { return tx.inner.encryptedPayload() }
+
+// DecryptionKey returns the decryption key of a decryption key transaction.
+func (tx *Transaction) DecryptionKey() []byte { return tx.inner.decryptionKey() }
+
+// BatchIndex returns the batch index (a.k.a sequence number) of a Shutter transaction,
+func (tx *Transaction) BatchIndex() uint64 { return tx.inner.batchIndex() }
+
+// L1BlockNumber returns the Layer 1 block number used for identifying the
+// collator/keyper config
+func (tx *Transaction) L1BlockNumber() uint64 { return tx.inner.l1BlockNumber() }
+
+// Timestamp returns the timestamp ()
+func (tx *Transaction) Timestamp() *big.Int { return tx.inner.timestamp() }
+
+// Transactions returns the list of RLP-byte serialised ShutterTxs and plaintext txs included in the batch
+func (tx *Transaction) Transactions() [][]byte { return tx.inner.transactions() }
 
 // Cost returns gas * gasPrice + value.
 func (tx *Transaction) Cost() *big.Int {
