@@ -18,9 +18,12 @@ package core
 
 import (
 	"fmt"
+	"log"
 	"math/big"
+	"reflect"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -28,6 +31,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/shutter-network/shutter/shlib/shcrypto"
 )
 
 // StateProcessor is a basic Processor, which takes care of transitioning
@@ -142,13 +147,416 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 // and uses the input parameters for its environment. It returns the receipt
 // for the transaction, gas used and an error if the transaction failed,
 // indicating the block was invalid.
-func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, *ExecutionResult, error) {
-	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number), header.BaseFee)
+func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) ([]*types.Receipt, []*ExecutionResult, error) {
+	blockContext := NewEVMBlockContext(header, bc, author)
+	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
+	signer := types.MakeSigner(config, header.Number)
+
+	// check that tx is batch tx
+	if tx.Type() != types.BatchTxType {
+		return nil, nil, fmt.Errorf("transaction is not a batch tx")
+	}
+
+	// check chain id
+	if tx.ChainId().Cmp(config.ChainID) != 0 {
+		return nil, nil, fmt.Errorf("batch has incorrect chain id %d instead of %d", tx.ChainId(), config.ChainID)
+	}
+
+	// check and increment batch index
+	err := checkBatchIndex(vmenv, config.BatchCounterAddress, tx.BatchIndex())
 	if err != nil {
 		return nil, nil, err
 	}
-	// Create a new context to be used in the EVM environment
-	blockContext := NewEVMBlockContext(header, bc, author)
-	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
-	return applyTransaction(msg, config, bc, author, gp, statedb, header.Number, header.Hash(), tx, usedGas, vmenv)
+	incrementBatchIndexMsg, err := makeIncrementBatchIndexMessage(blockContext, statedb, config, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	incrementBatchIndexTx := types.NewTransaction(
+		incrementBatchIndexMsg.Nonce(),    // nonce
+		*incrementBatchIndexMsg.To(),      // to
+		incrementBatchIndexMsg.Value(),    // amount
+		incrementBatchIndexMsg.Gas(),      // gas limit
+		incrementBatchIndexMsg.GasPrice(), // gas price
+		incrementBatchIndexMsg.Data(),     // data
+	)
+	batchIndexIncrementGas := uint64(0)
+	receipt, _, err := applyTransaction(
+		incrementBatchIndexMsg,
+		config,
+		bc,
+		nil,
+		gp,
+		statedb,
+		header.Number,
+		header.Hash(),
+		incrementBatchIndexTx,
+		&batchIndexIncrementGas,
+		vmenv,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return nil, nil, fmt.Errorf("batch index increment message failed")
+	}
+	batchIndexIncrementFee := new(big.Int).Mul(new(big.Int).SetUint64(batchIndexIncrementGas), header.BaseFee)
+	statedb.AddBalance(header.Coinbase, batchIndexIncrementFee) // refund sequencer for incrementing batch index
+
+	// check the decryption key against the eon key in the eon key storage contract (unless the
+	// keypers have not published a key yet)
+	decryptionKey := &shcrypto.EpochSecretKey{}
+	err = decryptionKey.Unmarshal(tx.DecryptionKey())
+	if err != nil {
+		return nil, nil, fmt.Errorf("decryption key is invalid")
+	}
+	blankTxContext := vm.TxContext{Origin: common.Address{}, GasPrice: common.Big0}
+	e := vm.NewEVM(blockContext, blankTxContext, statedb, config, cfg)
+	eonKey, err := getEonKeyFromContract(e, config.EonKeyBroadcastAddress, tx.L1BlockNumber())
+	if err != nil {
+		return nil, nil, err
+	}
+	var processShutterTxs bool
+	if eonKey != nil {
+		processShutterTxs = true
+		epochID := common.BigToHash(new(big.Int).SetUint64(tx.BatchIndex())).Bytes()
+		ok, err := shcrypto.VerifyEpochSecretKey(decryptionKey, eonKey, epochID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return nil, nil, fmt.Errorf("decryption key is not correct for batch %d", tx.BatchIndex())
+		}
+	} else {
+		processShutterTxs = false
+	}
+
+	// check batch signature (if the collator config contract has been deployed yet)
+	batchTxSigner, err := signer.Sender(tx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid batch signature: %s", err)
+	}
+	collatorAddress, err := getCollatorAddress(e, config.CollatorConfigListAddress, tx.L1BlockNumber())
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get collator address from config list contract: %s", err)
+	}
+	log.Printf("collator for block #%d: %s", tx.L1BlockNumber(), collatorAddress)
+	if collatorAddress != nil && batchTxSigner != *collatorAddress {
+		return nil, nil, fmt.Errorf("batch was signed by %s instead of collator %s (at mainchain block %d)", batchTxSigner, collatorAddress, tx.L1BlockNumber())
+	}
+
+	// check l1BlockNumber and timestamp
+	// TODO
+
+	// unmarshal transactions
+	transactions := []*types.Transaction{}
+	for i, txBytes := range tx.Transactions() {
+		tx := new(types.Transaction)
+		err := tx.UnmarshalBinary(txBytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("batch tx contains invalid transaction at index %d: %s", i, err)
+		}
+		if tx.Type() == types.BatchTxType {
+			return nil, nil, fmt.Errorf("batch tx contains batch tx at index %d", i)
+		}
+		transactions = append(transactions, tx)
+	}
+
+	// Execute the envelopes of shutter txs if we found the eon key.
+	if processShutterTxs {
+		for i, tx := range transactions {
+			if tx.Type() != types.ShutterTxType {
+				continue
+			}
+			sender, err := signer.Sender(tx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not extract signer of tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+
+			if tx.BatchIndex() != tx.BatchIndex() {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: batch index mismatch between shutter tx and batch (%d != %d)",
+					i, tx.Hash(), tx.BatchIndex(), tx.BatchIndex())
+			}
+			if tx.L1BlockNumber() != tx.L1BlockNumber() {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: l1 block number mismatch between shutter tx and batch (%d != %d)",
+					i, tx.Hash(), tx.L1BlockNumber(), tx.L1BlockNumber())
+			}
+
+			if tx.Gas() < params.TxGas {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: tx gas lower than minimum (%v < %v)", i, tx.Hash(), tx.Gas(), params.TxGas)
+			}
+			if tx.GasFeeCap().Cmp(tx.GasTipCap()) < 0 {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: gas fee cap lower than gas tip cap (%v < %v)", i, tx.Hash(), tx.GasFeeCap(), tx.GasTipCap())
+			}
+			if tx.GasFeeCap().Cmp(header.BaseFee) < 0 {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: gas fee cap lower than header base fee (%v < %v)", i, tx.Hash(), tx.GasFeeCap(), header.BaseFee)
+			}
+
+			priorityFeeGasPrice := math.BigMin(tx.GasTipCap(), new(big.Int).Sub(tx.GasFeeCap(), header.BaseFee))
+			priorityFee := new(big.Int).Mul(priorityFeeGasPrice, new(big.Int).SetUint64(tx.Gas()))
+			gasPrice := new(big.Int).Add(priorityFeeGasPrice, header.BaseFee)
+			gasFee := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(tx.Gas()))
+
+			balance := statedb.GetBalance(sender)
+			if balance.Cmp(gasFee) < 0 {
+				return nil, nil, fmt.Errorf("invalid tx %d [%v]: cannot pay for gas", i, tx.Hash())
+			}
+			statedb.SubBalance(sender, gasFee)
+			statedb.AddBalance(header.Coinbase, priorityFee)
+		}
+	}
+
+	// execute transactions
+	receipts := []*types.Receipt{}
+	results := []*ExecutionResult{}
+	for i, tx := range transactions {
+		if tx.Type() == types.ShutterTxType && !processShutterTxs {
+			continue
+		}
+
+		sender, err := signer.Sender(tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not extract signer of tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		// Manually check the nonce. This is redundant for all txs that actually get applied,
+		// but not for Shutter txs that fail to get decrypted.
+		accountNonce := statedb.GetNonce(sender)
+		if tx.Nonce() != accountNonce {
+			return nil, nil, fmt.Errorf("invalid tx %d [%v]: tx nonce does not match account nonce (%d != %d)", i, tx.Hash(), tx.Nonce(), accountNonce)
+		}
+
+		var msg types.Message
+		if tx.Type() == types.ShutterTxType {
+			decryptedPayload, err := decryptPayload(tx.EncryptedPayload(), decryptionKey)
+			if err != nil {
+				fmt.Printf("could not decrypt tx %d [%v]: %s\n", i, tx.Hash().Hex(), err)
+				statedb.SetNonce(sender, tx.Nonce()+1)
+				continue
+			}
+			msg, err = decryptedPayload.AsMessage(tx, signer)
+			if err != nil {
+				fmt.Printf("could not convert decrypted tx %d into msg [%v]: %s\n", i, tx.Hash().Hex(), err)
+				statedb.SetNonce(sender, tx.Nonce()+1)
+				continue
+			}
+		} else {
+			msg, err = tx.AsMessage(signer, header.BaseFee)
+			if err != nil {
+				return nil, nil, fmt.Errorf(
+					"could not convert tx %d into msg [%v]: %w",
+					i,
+					tx.Hash().Hex(),
+					err,
+				)
+			}
+		}
+
+		// execute transaction
+		statedb.Prepare(tx.Hash(), i)
+		receipt, result, err := applyTransaction(
+			msg,
+			config,
+			bc,
+			nil,
+			gp,
+			statedb,
+			header.Number,
+			header.Hash(),
+			tx,
+			usedGas,
+			vmenv,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		receipts = append(receipts, receipt)
+		results = append(results, result)
+	}
+
+	return receipts, results, nil
+}
+
+// checkBatchIndex checks that the current batch counter value equals the given batch index.
+func checkBatchIndex(e *vm.EVM, batchCounterContract common.Address, batchIndex uint64) error {
+	currentBatchIndex, err := getBatchIndex(e, batchCounterContract)
+	if err != nil {
+		return nil
+	}
+	if currentBatchIndex != batchIndex {
+		return fmt.Errorf("expected batch #%d, but got batch #%d", currentBatchIndex, batchIndex)
+	}
+	return nil
+}
+
+// getBatchIndex returns the current batch index in the batch counter contract.
+func getBatchIndex(e *vm.EVM, batchCounterContract common.Address) (uint64, error) {
+	caller := vm.AccountRef(common.Address{})
+	callData, err := batchCounterABI.Pack("batchIndex")
+	if err != nil {
+		return 0, err
+	}
+	result, _, err := e.Call(caller, batchCounterContract, callData, 1000000, common.Big0)
+	if err != nil {
+		return 0, err
+	}
+
+	resultBig := new(big.Int).SetBytes(result)
+	resultUint64 := resultBig.Uint64()
+	if new(big.Int).SetUint64(resultUint64).Cmp(resultBig) != 0 {
+		return 0, fmt.Errorf("get batch index contract call result is not a uint64")
+	}
+	return resultUint64, nil
+}
+
+func makeIncrementBatchIndexMessage(blockCtx vm.BlockContext, statedb vm.StateDB, chainConfig *params.ChainConfig, config vm.Config) (types.Message, error) {
+	nonce := statedb.GetNonce(common.Address{})
+	callData, err := batchCounterABI.Pack("increment")
+	if err != nil {
+		return types.Message{}, err
+	}
+	return types.NewMessage(
+		common.Address{},                 // from
+		&chainConfig.BatchCounterAddress, // to
+		nonce,                            // nonce
+		common.Big0,                      // amount
+		1000000,                          // gas limit
+		common.Big0,                      // gas price
+		common.Big0,                      // gas fee cap
+		common.Big0,                      // gas tip cap
+		callData,                         // data
+		nil,                              // access list
+		false,                            // fake
+	), nil
+}
+
+func getEonKeyFromContract(e *vm.EVM, eonKeyContract common.Address, blockNumber uint64) (*shcrypto.EonPublicKey, error) {
+	caller := vm.AccountRef(common.Address{})
+
+	callData, err := eonKeyStorageABI.Pack("get", blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	result, _, err := e.Call(caller, eonKeyContract, callData, 1000000, common.Big0)
+	if err != nil {
+		log.Printf("failed to find eon key for block #%d: %s", blockNumber, err)
+		return nil, nil
+	}
+	if len(result) == 0 {
+		log.Printf("no eon key available for block #%d", blockNumber)
+		return nil, nil
+	}
+
+	// decode result with abi
+	decoded, err := eonKeyStorageABI.Unpack("get", result)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) != 1 {
+		return nil, fmt.Errorf("decoded multiple outputs with eon key storage abi")
+	}
+	eonKeyBytes, ok := decoded[0].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("could not decode bytes out of eon key output")
+	}
+
+	eonKey := &shcrypto.EonPublicKey{}
+	err = eonKey.Unmarshal(eonKeyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return eonKey, nil
+}
+
+// getCollatorAddress returns the address configured as the collator in the collator config
+// contract for the given L1 block number. If the contract hasn't been deployed yet, it returns
+// nil.
+func getCollatorAddress(e *vm.EVM, collatorConfigContract common.Address, blockNumber uint64) (*common.Address, error) {
+	if e.StateDB.GetCodeSize(collatorConfigContract) == 0 {
+		return nil, nil
+	}
+
+	caller := vm.AccountRef(common.Address{})
+	configData, err := collatorConfigABI.Pack("getActiveConfig", blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	configResult, _, err := e.Call(caller, collatorConfigContract, configData, 1000000, common.Big0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active collator config index: %s", err)
+	}
+	configReturnValues, err := collatorConfigABI.Unpack("getActiveConfig", configResult)
+	if err != nil {
+		return nil, err
+	}
+	if len(configReturnValues) != 1 {
+		return nil, fmt.Errorf("expected getActiveConfig to return 1 value, got %d", len(configReturnValues))
+	}
+	setIndex := reflect.ValueOf(configReturnValues[0]).FieldByName("SetIndex").Uint()
+	if setIndex == 0 {
+		// Set index 0 is used as a guard element and contains no addresses. If this is the active
+		// config, no real config has been deployed yet. We return nil to signal that, similar to
+		// what we'd do if the collator config contract hasn't been deployed yet at all.
+		return nil, nil
+	}
+
+	addrsSeqData, err := collatorConfigABI.Pack("addrsSeq")
+	if err != nil {
+		return nil, err
+	}
+	addrsSeqResult, _, err := e.Call(caller, collatorConfigContract, addrsSeqData, 1000000, common.Big0)
+	if err != nil {
+		return nil, err
+	}
+	addrsSeqReturnValues, err := collatorConfigABI.Unpack("addrsSeq", addrsSeqResult)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrsSeqReturnValues) != 1 {
+		return nil, fmt.Errorf("expected addrsSeq call to return one value, got %d", len(addrsSeqReturnValues))
+	}
+	addrsSeqAddress, ok := addrsSeqReturnValues[0].(common.Address)
+	if !ok {
+		return nil, fmt.Errorf("expected addrsSeq call to return address")
+	}
+
+	atData, err := addrsSeqABI.Pack("at", setIndex, uint64(0))
+	if err != nil {
+		return nil, err
+	}
+	atResult, _, err := e.Call(caller, addrsSeqAddress, atData, 1000000, common.Big0)
+	if err != nil {
+		return nil, err
+	}
+	atReturnValues, err := addrsSeqABI.Unpack("at", atResult)
+	if err != nil {
+		return nil, err
+	}
+	if len(atReturnValues) != 1 {
+		return nil, fmt.Errorf("expected exactly one return value, got %d", len(atReturnValues))
+	}
+	collator, ok := atReturnValues[0].(common.Address)
+	if !ok {
+		return nil, fmt.Errorf("could not decode at return value as address")
+	}
+	return &collator, nil
+}
+
+func decryptPayload(encryptedPayloadBytes []byte, decryptionKey *shcrypto.EpochSecretKey) (*types.DecryptedPayload, error) {
+	encryptedPayload := shcrypto.EncryptedMessage{}
+	err := encryptedPayload.Unmarshal(encryptedPayloadBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	decryptedPayloadBytes, err := encryptedPayload.Decrypt(decryptionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var decryptedPayload types.DecryptedPayload
+	err = rlp.DecodeBytes(decryptedPayloadBytes, &decryptedPayload)
+	if err != nil {
+		return nil, err
+	}
+	return &decryptedPayload, nil
 }
