@@ -148,6 +148,26 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 // for the transaction, gas used and an error if the transaction failed,
 // indicating the block was invalid.
 func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) ([]*types.Receipt, []*ExecutionResult, error) {
+	if tx.Type() == types.BatchTxType {
+		return ApplyBatchTransaction(config, bc, author, gp, statedb, header, tx, usedGas, cfg)
+	}
+
+	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number), header.BaseFee)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Create a new context to be used in the EVM environment
+	blockContext := NewEVMBlockContext(header, bc, author)
+	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
+	receipt, result, err := applyTransaction(msg, config, bc, author, gp, statedb, header.Number, header.Hash(), tx, usedGas, vmenv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return []*types.Receipt{receipt}, []*ExecutionResult{result}, nil
+}
+
+// ApplyBatchTransaction applies a BatchTx to the given state database.
+func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) ([]*types.Receipt, []*ExecutionResult, error) {
 	blockContext := NewEVMBlockContext(header, bc, author)
 	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
 	signer := types.MakeSigner(config, header.Number)
