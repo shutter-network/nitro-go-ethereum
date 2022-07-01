@@ -224,10 +224,42 @@ func ArbitrumDevnetDASChainConfig() *ChainConfig {
 	}
 }
 
+func ShutterizedArbitrumDevTestChainConfig() *ChainConfig {
+	return &ChainConfig{
+		ChainID:             big.NewInt(452346),
+		HomesteadBlock:      big.NewInt(0),
+		DAOForkBlock:        nil,
+		DAOForkSupport:      true,
+		EIP150Block:         big.NewInt(0),
+		EIP150Hash:          common.Hash{},
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(0),
+
+		BatchCounterAddress:       common.HexToAddress("0xa513E6E4b8f2a923D98304ec87F64353C4D5C853"),
+		EonKeyBroadcastAddress:    common.HexToAddress("0x0165878A594ca255338adfa4d48449f69242Eb8F"),
+		CollatorConfigListAddress: common.HexToAddress("0x5FC8d32690cc91D4c39d9d3abcBD16989F875707"),
+
+		ArbitrumChainParams: ArbitrumDevTestParams(),
+		Clique: &CliqueConfig{
+			Period: 0,
+			Epoch:  0,
+		},
+	}
+}
+
 var ArbitrumSupportedChainConfigs = []*ChainConfig{
 	ArbitrumOneChainConfig(),
 	ArbitrumTestnetChainConfig(),
 	ArbitrumDevTestChainConfig(),
 	ArbitrumDevTestDASChainConfig(),
 	ArbitrumDevnetDASChainConfig(),
+
+	ShutterizedArbitrumDevTestChainConfig(),
 }
