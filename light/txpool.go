@@ -387,6 +387,7 @@ func (pool *TxPool) validateTx(ctx context.Context, tx *types.Transaction) error
 		return err
 	}
 	if tx.Gas() < gas {
+		fmt.Printf("HERE LIGHT POOL")
 		return core.ErrIntrinsicGas
 	}
 	return currentState.Error()
