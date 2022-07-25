@@ -167,23 +167,23 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 }
 
 // ApplyBatchTransaction applies a BatchTx to the given state database.
-func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) ([]*types.Receipt, []*ExecutionResult, error) {
+func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, batchTx *types.Transaction, usedGas *uint64, cfg vm.Config) ([]*types.Receipt, []*ExecutionResult, error) {
 	blockContext := NewEVMBlockContext(header, bc, author)
 	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
 	signer := types.MakeSigner(config, header.Number)
 
 	// check that tx is batch tx
-	if tx.Type() != types.BatchTxType {
+	if batchTx.Type() != types.BatchTxType {
 		return nil, nil, fmt.Errorf("transaction is not a batch tx")
 	}
 
 	// check chain id
-	if tx.ChainId().Cmp(config.ChainID) != 0 {
-		return nil, nil, fmt.Errorf("batch has incorrect chain id %d instead of %d", tx.ChainId(), config.ChainID)
+	if batchTx.ChainId().Cmp(config.ChainID) != 0 {
+		return nil, nil, fmt.Errorf("batch has incorrect chain id %d instead of %d", batchTx.ChainId(), config.ChainID)
 	}
 
 	// check and increment batch index
-	err := checkBatchIndex(vmenv, config.BatchCounterAddress, tx.BatchIndex())
+	err := checkBatchIndex(vmenv, config.BatchCounterAddress, batchTx.BatchIndex())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -225,43 +225,43 @@ func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *
 	// check the decryption key against the eon key in the eon key storage contract (unless the
 	// keypers have not published a key yet)
 	decryptionKey := &shcrypto.EpochSecretKey{}
-	err = decryptionKey.Unmarshal(tx.DecryptionKey())
+	err = decryptionKey.Unmarshal(batchTx.DecryptionKey())
 	if err != nil {
 		return nil, nil, fmt.Errorf("decryption key is invalid")
 	}
 	blankTxContext := vm.TxContext{Origin: common.Address{}, GasPrice: common.Big0}
 	e := vm.NewEVM(blockContext, blankTxContext, statedb, config, cfg)
-	eonKey, err := getEonKeyFromContract(e, config.EonKeyBroadcastAddress, tx.L1BlockNumber())
+	eonKey, err := getEonKeyFromContract(e, config.EonKeyBroadcastAddress, batchTx.L1BlockNumber())
 	if err != nil {
 		return nil, nil, err
 	}
 	var processShutterTxs bool
 	if eonKey != nil {
 		processShutterTxs = true
-		epochID := common.BigToHash(new(big.Int).SetUint64(tx.BatchIndex())).Bytes()
+		epochID := common.BigToHash(new(big.Int).SetUint64(batchTx.BatchIndex())).Bytes()
 		ok, err := shcrypto.VerifyEpochSecretKey(decryptionKey, eonKey, epochID)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !ok {
-			return nil, nil, fmt.Errorf("decryption key is not correct for batch %d", tx.BatchIndex())
+			return nil, nil, fmt.Errorf("decryption key is not correct for batch %d", batchTx.BatchIndex())
 		}
 	} else {
 		processShutterTxs = false
 	}
 
 	// check batch signature (if the collator config contract has been deployed yet)
-	batchTxSigner, err := signer.Sender(tx)
+	batchTxSigner, err := signer.Sender(batchTx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid batch signature: %s", err)
 	}
-	collatorAddress, err := getCollatorAddress(e, config.CollatorConfigListAddress, tx.L1BlockNumber())
+	collatorAddress, err := getCollatorAddress(e, config.CollatorConfigListAddress, batchTx.L1BlockNumber())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get collator address from config list contract: %s", err)
 	}
-	log.Printf("collator for block #%d: %s", tx.L1BlockNumber(), collatorAddress)
+	log.Printf("collator for block #%d: %s", batchTx.L1BlockNumber(), collatorAddress)
 	if collatorAddress != nil && batchTxSigner != *collatorAddress {
-		return nil, nil, fmt.Errorf("batch was signed by %s instead of collator %s (at mainchain block %d)", batchTxSigner, collatorAddress, tx.L1BlockNumber())
+		return nil, nil, fmt.Errorf("batch was signed by %s instead of collator %s (at mainchain block %d)", batchTxSigner, collatorAddress, batchTx.L1BlockNumber())
 	}
 
 	// check l1BlockNumber and timestamp
@@ -269,7 +269,7 @@ func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *
 
 	// unmarshal transactions
 	transactions := []*types.Transaction{}
-	for i, txBytes := range tx.Transactions() {
+	for i, txBytes := range batchTx.Transactions() {
 		tx := new(types.Transaction)
 		err := tx.UnmarshalBinary(txBytes)
 		if err != nil {
@@ -292,11 +292,11 @@ func ApplyBatchTransaction(config *params.ChainConfig, bc ChainContext, author *
 				return nil, nil, fmt.Errorf("could not extract signer of tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 			}
 
-			if tx.BatchIndex() != tx.BatchIndex() {
+			if tx.BatchIndex() != batchTx.BatchIndex() {
 				return nil, nil, fmt.Errorf("invalid tx %d [%v]: batch index mismatch between shutter tx and batch (%d != %d)",
 					i, tx.Hash(), tx.BatchIndex(), tx.BatchIndex())
 			}
-			if tx.L1BlockNumber() != tx.L1BlockNumber() {
+			if tx.L1BlockNumber() != batchTx.L1BlockNumber() {
 				return nil, nil, fmt.Errorf("invalid tx %d [%v]: l1 block number mismatch between shutter tx and batch (%d != %d)",
 					i, tx.Hash(), tx.L1BlockNumber(), tx.L1BlockNumber())
 			}
